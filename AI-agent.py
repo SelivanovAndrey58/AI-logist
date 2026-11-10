@@ -2,40 +2,60 @@ import inspect
 import pprint
 import json
 from openai import OpenAI
+import sqlite3
+from pathlib import Path
+
+DB_PATH = Path(__file__).resolve().parent / "logistics.db"
 
 
-# =====================================================================
-# 1. АВТОМАТИЗАЦИЯ СБОРА ИНСТРУМЕНТОВ (TOOL CALLING ENGINE)
-# =====================================================================
+# Перенесём клиентов в SQLite, чтобы можно было добавлять новых клиентов и заказы
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+
+        conn.execute("PRAGMA foreign_keys = ON")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS clients (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                email TEXT NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id INTEGER NOT NULL,
+                from_city TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'created',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (client_id) REFERENCES clients(id)
+            )
+        """)
+
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO clients (id, name, email)
+            VALUES (?, ?, ?)
+        """,
+            [(1, "ООО Альфа", "info@alfa.ru"), (2, "ООО Бета", "info@beta.ru")],
+        )
+
+
+# Декоратор для маркировки функций как инструментов
 def tool(func):
-    """
-    Декоратор для маркировки методов класса как доступных инструментов для ИИ.
-    Добавляет функции специальный флаг `is_tool = True`.
-    """
     func.is_tool = True
     return func
 
-# Функция конвертации типов данных
+
+# 1. Функция конвертации типов данных
 def python_type_to_json_type(param_type):
-    """
-    Конвертирует строгие типы данных Python в стандартные типы JSON Schema.
-    Это необходимо, так как LLM-модели принимают описание инструментов в формате JSON.
-    """
-    type_mapping = {
-        str: "string",
-        int: "integer",
-        float: "number",
-        bool: "boolean"
-    }
-    # Если тип не найден в маппинге, по умолчанию возвращаем "string"
+    type_mapping = {str: "string", int: "integer", float: "number", bool: "boolean"}
     return type_mapping.get(param_type, "string")
 
-# Функция извлечения описания параметров из docstring
+
+# 2. Функция извлечения описания параметров из docstring
 def get_parameter_description(docstring, parameter_name):
-    """
-    Парсит docstring (документацию) функции, чтобы извлечь описание конкретного параметра.
-    Ищет строку, начинающуюся с имени параметра, и забирает текст после разделителя '—'.
-    """
     lines = docstring.split("\n")
     for line in lines:
         cleaned_line = line.strip()
@@ -43,209 +63,258 @@ def get_parameter_description(docstring, parameter_name):
             parts = cleaned_line.split("—", 1)
             if len(parts) > 1:
                 description = parts[1].strip()
-                # Форматируем текст: делаем первую букву заглавной и убираем точку на конце
                 return description.capitalize().rstrip(".")
     return ""
 
-# Функция генерации схемы инструмента
+
+# 3. Функция генерации схемы инструмента
 def get_tool_info(tool_func):
-       """
-    Главная функция генерации JSON-схемы инструмента (Function Specification).
-    Использует модуль `inspect` для динамического анализа сигнатуры функции (параметров и их типов).
-    """
     sig = inspect.signature(tool_func)
     docstring = inspect.getdoc(tool_func) or ""
-    # Извлекаем главное описание функции (первую непустую строку до описания параметров)
+
     main_description = ""
     for line in docstring.split("\n"):
         cleaned = line.strip()
         if cleaned and not any(cleaned.startswith(p) for p in sig.parameters):
             main_description = cleaned
             break
-            
-    # Базовый каркас схемы, который требует OpenAI / Ollama API
+
     tool_info = {
         "type": "function",
         "function": {
             "name": tool_func.__name__,
             "description": main_description,
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        }
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
     }
 
     properties = tool_info["function"]["parameters"]["properties"]
     required_list = tool_info["function"]["parameters"]["required"]
 
-    # Динамически разбираем каждый аргумент функции
     for param_name, param in sig.parameters.items():
-        if param_name == 'self': # Пропускаем ссылку на экземпляр класса
+        if param_name == "self":
             continue
-            
+
         json_type = python_type_to_json_type(param.annotation)
         param_desc = get_parameter_description(docstring, param_name)
 
-        # Заполняем свойства аргумента в схему
-        properties[param_name] = {
-            "type": json_type,
-            "description": param_desc
-        }
-        # Если у параметра нет дефолтного значения, он добавляется в список обязательных (required)
+        properties[param_name] = {"type": json_type, "description": param_desc}
+
         if param.default == inspect.Parameter.empty:
             required_list.append(param_name)
-            
+
     return tool_info
 
-# Функция автоматического сбора всех @tool из класса
+
+# 4. Функция автоматического сбора всех @tool из класса
 def get_tools(tool_group):
-    """
-    Сканирует переданный класс (объект) и автоматически собирает схемы 
-    для всех методов, у которых есть декоратор `@tool`.
-    """
     collected_tools = []
     for name in dir(tool_group):
         tool_candidate = getattr(tool_group, name)
-        # Проверяем, что это функция и у нее есть наш флаг
         if callable(tool_candidate) and getattr(tool_candidate, "is_tool", False):
             tool_schema = get_tool_info(tool_candidate)
             collected_tools.append(tool_schema)
     return collected_tools
 
-# =====================================================================
-# 2. ОПИСАНИЕ БИЗНЕС-ЛОГИКИ И ИНСТРУМЕНТОВ ЛОГИСТИКИ
-# =====================================================================
+
+# --- Описание класса с инструментами ---
+
 
 class ClientTools:
-    """
-    Класс, содержащий реальные функции (инструменты), которые наш ИИ-агент 
-    сможет вызывать для решения задач автоматизации логистики.
-    """
+
     @tool
     def create_order(self, client_id: int, from_city: str):
         """
         Создает заказ на перевозку.
 
-
         client_id — ID клиента в CRM.
         from_city — город загрузки.
         """
-        # Имитация интеграции с ERP/CRM системой логистики
-        pass
+        with sqlite3.connect(DB_PATH) as conn:
+
+            conn.execute("PRAGMA foreign_keys = ON")
+
+            conn.row_factory = sqlite3.Row
+
+            client = conn.execute(
+                """
+                SELECT id, name
+                FROM clients
+                WHERE id = ?
+            """,
+                (client_id,),
+            ).fetchone()
+
+            if client is None:
+                return {
+                    "success": False,
+                    "error": "client_not_found",
+                    "message": f"Клиент с ID {client_id} не найден.",
+                }
+
+            cursor = conn.execute(
+                """
+                INSERT INTO orders (client_id, from_city)
+                VALUES (?, ?)
+            """,
+                (client_id, from_city),
+            )
+
+            order_id = cursor.lastrowid
+
+        return {
+            "success": True,
+            "order_id": order_id,
+            "client_id": client["id"],
+            "client_name": client["name"],
+            "from_city": from_city,
+            "status": "created",
+        }
 
     @tool
     def find_client(self, client_name: str):
         """
         Находит клиента по названию компании.
 
-
         client_name — название компании для поиска.
         """
-        # Имитация базы данных (Mock-данные) клиентов компании
-        clients = {
-            "ООО Альфа": {
-                "id": 1,
-                "name": "ООО Альфа",
-                "email": "info@alfa.ru"
-            },
-            "ООО Бета": {
-                "id": 2,
-                "name": "ООО Бета",
-                "email": "info@beta.ru"
-            }
-        }
-        return clients.get(client_name)
+        with sqlite3.connect(DB_PATH) as conn:
+
+            conn.execute("PRAGMA foreign_keys = ON")
+
+            conn.row_factory = sqlite3.Row
+
+            row = conn.execute(
+                """
+                SELECT id, name, email
+                FROM clients
+                WHERE name = ?
+            """,
+                (client_name,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return dict(row)
+
 
 # Инициализируем инструменты и собираем их схемы
 client_tools = ClientTools()
-# Автоматически генерируем список JSON-схем для передачи в LLM
 tools = get_tools(client_tools)
 
-# Реестр (маппинг) для сопоставления строкового имени функции от ИИ с реальным методом в Python
+# Реестр инструментов для сопоставления имени со ссылкой на метод
 tool_registry = {
     "create_order": client_tools.create_order,
-    "find_client": client_tools.find_client
+    "find_client": client_tools.find_client,
 }
-# Выводим сгенерированные схемы в консоль для визуальной проверки структуры
-print("--- Сгенерированный список инструментов (tools) ---")
-pprint.pprint(tools, sort_dicts=False, width=100)
-print("\n" + "="*50 + "\n")
+init_db()
+print("[База данных] Таблица заказов готова.")
 
+# --- ОТПРАВКА В ЛОКАЛЬНЫЙ GPT ЧЕРЕЗ OLLAMA (ШАГ 1) ---
 
-# =====================================================================
-# 3. ВЗАИМОДЕЙСТВИЕ С ЛОКАЛЬНОЙ МОДЕЛЬЮ ЧЕРЕЗ OLLAMA
-# =====================================================================
-# Настраиваем клиент для работы с Ollama (используем совместимый с OpenAI формат API)
-client = OpenAI(
-    base_url="http://localhost:11434/v1",
-    api_key="ollama" # Для Ollama ключ может быть любой строкой
-)
+client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
 
-user_prompt = "Найди клиента ООО Альфа"
+user_prompt = "Создай заказ на перевозку из Самары для клиента с ID 1."
 
-# --- ШАГ 1: Отправляем запрос пользователя и список доступных инструментов в LLM ---
 print(f"Отправка первого запроса: '{user_prompt}'...")
 response = client.chat.completions.create(
-    model="qwen2.5:3b", # Используем легкую локальную модель Qwen
+    model="qwen2.5:3b",
     messages=[
+        {
+            "role": "system",
+            "content": (
+                "Ты — AI-Логист. Всегда отвечай на русском языке. "
+                "Используй только данные, полученные от инструментов. "
+                "Не выдумывай результаты операций. "
+                "Если инструмент вернул ошибку или клиент не найден, "
+                "кратко и ясно сообщи об этом пользователю."
+            )
+        },
         {"role": "user", "content": user_prompt}
     ],
-    tools=tools # Передаем сгенерированные схемы инструментов
+    tools=tools
 )
+
+# --- ВЫПОЛНЕНИЕ ИНСТРУМЕНТОВ И СБОР ИСТОРИИ ---
 
 message = response.choices[0].message
 
-# --- ШАГ 2: Анализируем ответ модели на предмет вызова функций (Tool Calls) ---
-
 if message.tool_calls:
-    print("\n[ИИ] Обнаружен запрос на вызов функции!")
-    # Извлекаем первый вызов функции из списка, предложенного моделью
-    tool_call = message.tool_calls[0]
-    # Парсим аргументы, которые ИИ извлек из текста пользователя (переводим из JSON-строки в dict)
-    arguments = json.loads(tool_call.function.arguments)
-    print(f"[ИИ] Аргументы, собранные моделью: {arguments}")
+    print("\n[ИИ] Обнаружен запрос на вызов инструмента!")
 
-    # Ищем имя функции в нашем локальном реестре Python
-    tool_name = tool_call.function.name
-    tool = tool_registry.get(tool_name)
-    
-    if tool is None:
-        print("Ошибка: неизвестный инструмент")
-    else:
-        # Выполняем реальный Python-код, распаковывая аргументы из ИИ (**arguments)
-        result = tool(**arguments)
-        print("Результат выполнения инструмента:", result)
-        
-        # Формируем цепочку контекста (историю сообщений) для повторного запроса.
-        # Это критически важно: модель должна знать свой предыдущий ответ и то, что функция выполнена.
-        messages = [
+    # Сохраняем ответ модели вместе со всеми запросами инструментов
+    messages = [
+        {"role": "user", "content": user_prompt},
+        message.model_dump(exclude_none=True),
+    ]
+
+    # Выполняем каждый вызов, который запросила модель
+    for tool_call in message.tool_calls:
+        tool_name = tool_call.function.name
+
+        print(f"\n[ИИ] Выбран инструмент: {tool_name}")
+
+        try:
+            # Преобразуем JSON-строку аргументов в словарь
+            arguments = json.loads(tool_call.function.arguments)
+            print(f"[ИИ] Аргументы: {arguments}")
+
+            # Ищем инструмент в реестре
+            tool_func = tool_registry.get(tool_name)
+
+            if tool_func is None:
+                result = {"error": f"Неизвестный инструмент: {tool_name}"}
+            else:
+                # Вызываем функцию с аргументами от модели
+                result = tool_func(**arguments)
+
+            print("[Python] Результат:", result)
+
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            result = {"error": f"Некорректные аргументы инструмента: {exc}"}
+
+        except Exception as exc:
+            result = {"error": f"Ошибка при выполнении инструмента: {exc}"}
+
+        # Возвращаем результат конкретного вызова модели
+        messages.append(
             {
-                "role": "user",
-                "content": user_prompt
-            },
-            message  # Обязательно передаем ответ модели с флагом tool_calls
-        ]
-        
-        # Добавляем в историю результат работы функции с типом роли "tool"
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call.id,
-            "content": json.dumps(result, ensure_ascii=False)
-        })
-        
-        # --- ШАГ 3: Отправляем историю с результатом выполнения функции обратно в LLM ---
-        print("\nОтправка результата выполнения инструмента обратно в модель...")
-        final_response = client.chat.completions.create(
-            model="qwen2.5:3b",
-            messages=messages,
-            tools=tools
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": json.dumps(result, ensure_ascii=False, default=str),
+            }
         )
-        # Выводим итоговый текстовый ответ, который модель сгенерировала на основе данных из функции
-        print("\n=== Итоговый ответ ИИ для пользователя ===")
-        print(final_response.choices[0].message.content)
+
+    # Отправляем историю вместе со всеми результатами инструментов
+    print("\n[ИИ] Отправляем результаты обратно модели...")
+
+    final_response = client.chat.completions.create(
+        model="qwen2.5:3b", messages=messages, tools=tools
+    )
+
+    final_message = final_response.choices[0].message
+
+    print("\n=== Итоговый ответ ИИ для пользователя ===")
+    print(final_message.content or "Модель не вернула текстовый ответ.")
+
 else:
-    # Если модель не сочла нужным вызывать функции, выводим обычный текстовый ответ
-    print("\nМодель вернула обычный текст вместо вызова функции:")
+    print("\nМодель вернула обычный текст:")
     print(message.content)
+
+print("\n=== Проверка заказов в базе данных ===")
+
+with sqlite3.connect(DB_PATH) as conn:
+
+    conn.execute("PRAGMA foreign_keys = ON")
+
+    cursor = conn.execute("""
+        SELECT id, client_id, from_city, status, created_at
+        FROM orders
+        ORDER BY id DESC
+    """)
+
+    orders = cursor.fetchall()
+
+    for order in orders:
+        print(order)
